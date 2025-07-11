@@ -1,585 +1,933 @@
 package main
 
 import (
-	"encoding/gob"
 	"fmt"
+	"image"
 	"image/color"
-	"log"
 	"math"
 	"math/rand"
-	"net"
-	"os"
-	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
-	"github.com/hajimehoshi/ebiten/v2/text"
-	"golang.org/x/image/font"
+)
+
+const (
+	screenWidth     = 1920
+	screenHeight    = 1080
+	initialCols     = 6
+	initialRows     = 6
+	finalCols       = 24
+	finalRows       = 24
+	initialWidth    = 320
+	initialHeight   = 180
+	biomeCols       = 96 // 24*4 (так как масштабируем в 4 раза)
+	biomeRows       = 96
+	biomeCellWidth  = screenWidth / biomeCols
+	biomeCellHeight = screenHeight / biomeRows
+	heightLevels    = 5 // Количество уровней высоты
+	finalWidth      = screenWidth / finalCols
+	finalHeight     = screenHeight / finalRows
+)
+
+// Типы влажности
+type Humidity int
+
+const (
+	Arid Humidity = iota
+	Dry
+	Moist
+	Wet
+)
+
+// Реализация шума Перлина (исправленная)
+type perlinNoise struct {
+	seed    int64
+	octaves int
+	pers    float64
+	lac     float64
+}
+
+func perlinNoiseGenerator(octaves int, persistence, lacunarity float64, seed int64) *perlinNoise {
+	return &perlinNoise{
+		seed:    seed,
+		octaves: octaves,
+		pers:    persistence,
+		lac:     lacunarity,
+	}
+}
+
+func (p *perlinNoise) Noise2D(x, y float64) float64 {
+	var total float64
+	frequency := 1.0
+	amplitude := 1.0
+	maxValue := 0.0
+
+	for i := 0; i < p.octaves; i++ {
+		total += p.interpolatedNoise(x*frequency, y*frequency) * amplitude
+		maxValue += amplitude
+		amplitude *= p.pers
+		frequency *= p.lac
+	}
+
+	return total / maxValue
+}
+
+func (p *perlinNoise) interpolatedNoise(x, y float64) float64 {
+	ix := int(x)
+	iy := int(y)
+	fx := x - float64(ix)
+	fy := y - float64(iy)
+
+	v1 := p.smoothNoise(ix, iy)
+	v2 := p.smoothNoise(ix+1, iy)
+	v3 := p.smoothNoise(ix, iy+1)
+	v4 := p.smoothNoise(ix+1, iy+1)
+
+	i1 := p.interpolate(v1, v2, fx)
+	i2 := p.interpolate(v3, v4, fx)
+
+	return p.interpolate(i1, i2, fy)
+}
+
+func (p *perlinNoise) interpolate(a, b, x float64) float64 {
+	ft := x * math.Pi
+	f := (1 - math.Cos(ft)) * 0.5
+	return a*(1-f) + b*f
+}
+
+func (p *perlinNoise) smoothNoise(x, y int) float64 {
+	corners := (p.noise(x-1, y-1) + p.noise(x+1, y-1) + p.noise(x-1, y+1) + p.noise(x+1, y+1)) / 16
+	sides := (p.noise(x-1, y) + p.noise(x+1, y) + p.noise(x, y-1) + p.noise(x, y+1)) / 8
+	center := p.noise(x, y) / 4
+	return corners + sides + center
+}
+
+func (p *perlinNoise) noise(x, y int) float64 {
+	n := x + y*57
+	n = (n << 13) ^ n
+	// Исправленная формула для генерации шума
+	return 1.0 - float64((n*(n*n*15731+789221)+int(p.seed))&0x7fffffff)/1073741824.0
+}
+
+type Height int
+
+const (
+	WaterLevel Height = iota
+	Lowland
+	Hills
+	Mountains
+	HighMountains
 )
 
 type Game struct {
-	perlin              *Perlin
-	noiseMap            [][]float64
-	tiles               [][]color.Color
-	cities              [][]bool
-	mode                string
-	conn                net.Conn
-	encoder             *gob.Encoder
-	decoder             *gob.Decoder
-	players             map[string]Player
-	mu                  sync.Mutex
-	seed                int64
-	me                  Player
-	cameraX             int
-	cameraY             int
-	font                font.Face
-	cityList            []*City
-	hoverCity           *City
-	cityWindow          *CityWindow
-	cityMap             *CityMap
-	cityTemplates       map[int64]*CityMap
-	characters          []*Character
-	currentCharacter    *Character
-	characterIndex      int
-	characterWindowOpen bool
+	initialGrid  [][]bool
+	finalGrid    [][]bool
+	tempGrid     [][]Temperature
+	humidityGrid [][]Humidity
+	biomeGrid    [][]Biome
+	showInitial  bool
+	seed         int64
+	heightGrid   [][]Height
 }
 
-type Perlin struct {
-	permutation []int
-	gradients   [][]float64
+type Temperature int
+
+const (
+	Warm Temperature = iota
+	Hot
+	Cold
+	Frozen
+	Cool
+	Snow
+)
+
+type Biome int
+
+const (
+	Water Biome = iota
+	DeepWater
+	Tundra
+	Desert
+	Volcano
+	Forest
+	Meadow
+	Jungle
+	IceMountains
+)
+
+func NewGame() *Game {
+	g := &Game{
+		initialGrid: make([][]bool, initialRows),
+		seed:        time.Now().UnixNano(),
+	}
+	for i := range g.initialGrid {
+		g.initialGrid[i] = make([]bool, initialCols)
+	}
+	g.Regenerate()
+	return g
 }
 
-func main() {
-	rand.Seed(time.Now().UnixNano())
+func (g *Game) generateHeightMap() {
+	g.heightGrid = make([][]Height, finalRows)
+	noise := perlinNoiseGenerator(3, 0.5, 2.0, g.seed) // Измененные параметры шума
 
-	game := &Game{
-		perlin:   NewPerlin(time.Now().UnixNano()),
-		players:  make(map[string]Player),
-		font:     loadTrueTypeFont("assets/NotoSans-Regular.ttf", 14), // Загружаем наш шрифт вместо basicfont
-		cityList: make([]*City, 0),
-		me: Player{
-			ID:    fmt.Sprintf("игрок-%d", rand.Intn(1000)),
-			Color: randomColor(),
-		},
-		cameraX: -screenWidth / 4,  // Начальная позиция камеры
-		cameraY: -screenHeight / 4, // чтобы видеть больше карты
-	}
-	game.initCityWindow()
+	for y := 0; y < finalRows; y++ {
+		g.heightGrid[y] = make([]Height, finalCols)
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				g.heightGrid[y][x] = WaterLevel
+				continue
+			}
 
-	fmt.Println("Запустить как: [s]erver или [c]lient?")
-	var mode string
-	_, err := fmt.Scanln(&mode)
-	if err != nil {
-		log.Fatal("Ошибка ввода:", err)
-	}
+			dist := g.distanceToWater(x, y)
+			// Добавляем больше шума для естественного рельефа
+			pnoise := (noise.Noise2D(float64(x)/10, float64(y)/10) + 1) / 2
+			heightValue := (dist*0.6 + pnoise*0.4) * float64(heightLevels-1)
 
-	switch mode {
-	case "s":
-		game.mode = "server"
-		game.seed = time.Now().UnixNano()
-		game.perlin = NewPerlin(game.seed)
-		game.generateWorld()
-		game.generateCities()
-		go game.startServer()
+			// Немного случайности
+			heightValue += rand.Float64() * 0.3
 
-	case "c":
-		game.mode = "client"
-		game.connectToServer()
-	default:
-		log.Fatal("Неверный режим. Используйте 's' или 'c'")
-	}
-
-	ebiten.SetWindowSize(screenWidth/2, screenHeight/2)
-	ebiten.SetWindowTitle(fmt.Sprintf("Сетевой генератор мира (%s) - %s", mode, game.me.ID))
-	ebiten.SetWindowResizable(true)
-
-	if err := ebiten.RunGame(game); err != nil {
-		log.Fatal(err)
+			g.heightGrid[y][x] = Height(math.Min(float64(heightLevels-1), heightValue))
+		}
 	}
 }
 
-func randomColor() color.RGBA {
-	return color.RGBA{
-		uint8(rand.Intn(200) + 55),
-		uint8(rand.Intn(200) + 55),
-		uint8(rand.Intn(200) + 55),
-		255,
-	}
-}
+func (g *Game) distanceToWater(x, y int) float64 {
+	minDist := math.MaxFloat64
 
-func NewPerlin(seed int64) *Perlin {
-	p := &Perlin{
-		permutation: make([]int, 256),
-		gradients:   make([][]float64, 256),
-	}
-
-	r := rand.New(rand.NewSource(seed))
-
-	for i := 0; i < 256; i++ {
-		p.permutation[i] = i
+	// Проверяем все клетки карты, а не только соседей
+	for ny := 0; ny < finalRows; ny++ {
+		for nx := 0; nx < finalCols; nx++ {
+			if !g.finalGrid[ny][nx] { // Если это вода
+				dist := math.Sqrt(float64((nx-x)*(nx-x) + (ny-y)*(ny-y)))
+				if dist < minDist {
+					minDist = dist
+				}
+			}
+		}
 	}
 
-	for i := 255; i > 0; i-- {
-		j := r.Intn(i + 1)
-		p.permutation[i], p.permutation[j] = p.permutation[j], p.permutation[i]
-	}
-
-	for i := 0; i < 256; i++ {
-		angle := r.Float64() * 2 * math.Pi
-		p.gradients[i] = []float64{math.Cos(angle), math.Sin(angle)}
-	}
-
-	return p
+	// Нормализуем расстояние
+	maxPossibleDist := math.Sqrt(float64(finalCols*finalCols + finalRows*finalRows))
+	return minDist / maxPossibleDist
 }
 
-func (p *Perlin) Noise(x, y float64) float64 {
-	x0 := int(math.Floor(x)) & 255
-	y0 := int(math.Floor(y)) & 255
-	x1 := (x0 + 1) & 255
-	y1 := (y0 + 1) & 255
+func (g *Game) adjustTemperatureWithHeight() {
+	for y := 0; y < finalRows; y++ {
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				continue
+			}
 
-	sx := x - math.Floor(x)
-	sy := y - math.Floor(y)
-
-	n0 := p.dotGrid(x0, y0, x, y)
-	n1 := p.dotGrid(x1, y0, x, y)
-	ix0 := p.interpolate(n0, n1, sx)
-
-	n0 = p.dotGrid(x0, y1, x, y)
-	n1 = p.dotGrid(x1, y1, x, y)
-	ix1 := p.interpolate(n0, n1, sx)
-
-	return p.interpolate(ix0, ix1, sy)
-}
-
-func (p *Perlin) dotGrid(ix, iy int, x, y float64) float64 {
-	grad := p.gradients[p.permutation[(p.permutation[ix]+iy)%256]]
-	dx := x - float64(ix)
-	dy := y - float64(iy)
-	return dx*grad[0] + dy*grad[1]
-}
-
-func (p *Perlin) interpolate(a, b, t float64) float64 {
-	t = t * t * t * (t*(t*6-15) + 10)
-	return a + t*(b-a)
-}
-
-func (g *Game) generateWorld() {
-	cols := screenWidth / cellSize
-	rows := screenHeight / cellSize
-	g.noiseMap = make([][]float64, rows)
-	g.tiles = make([][]color.Color, rows)
-	g.cities = make([][]bool, rows)
-
-	for y := 0; y < rows; y++ {
-		g.noiseMap[y] = make([]float64, cols)
-		g.tiles[y] = make([]color.Color, cols)
-		g.cities[y] = make([]bool, cols)
-
-		for x := 0; x < cols; x++ {
-			nx := float64(x) * 0.05
-			ny := float64(y) * 0.05
-			g.noiseMap[y][x] = g.perlin.Noise(nx, ny)
-			value := (g.noiseMap[y][x] + 1) / 2
+			// Понижаем температуру с высотой
+			heightEffect := float64(g.heightGrid[y][x]) * 0.15 // 15% на уровень
+			r := rand.Float64() - heightEffect
 
 			switch {
-			case value < 0.4:
-				g.tiles[y][x] = color.RGBA{0, 105, 148, 255}
-			case value < 0.5:
-				g.tiles[y][x] = color.RGBA{194, 178, 128, 255}
-			case value < 0.75:
-				g.tiles[y][x] = color.RGBA{34, 139, 34, 255}
-			case value < 0.95:
-				g.tiles[y][x] = color.RGBA{100, 100, 100, 255}
+			case r < 0.60:
+				g.tempGrid[y][x] = Warm
+			case r < 0.80:
+				g.tempGrid[y][x] = Cold
 			default:
-				g.tiles[y][x] = color.RGBA{220, 220, 220, 255}
+				g.tempGrid[y][x] = Frozen
 			}
 		}
 	}
 }
 
-func (g *Game) startServer() {
-	ln, err := net.Listen("tcp", serverPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ln.Close()
+func (g *Game) generateHumidity() {
+	g.humidityGrid = make([][]Humidity, finalRows)
+	for y := 0; y < finalRows; y++ {
+		g.humidityGrid[y] = make([]Humidity, finalCols)
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				continue
+			}
 
-	fmt.Println("Сервер запущен на", ln.Addr())
+			waterInfluence := 0.0
+			// Учитываем большее расстояние до воды
+			for ny := 0; ny < finalRows; ny++ {
+				for nx := 0; nx < finalCols; nx++ {
+					if !g.finalGrid[ny][nx] {
+						dist := math.Sqrt(float64((nx-x)*(nx-x) + (ny-y)*(ny-y)))
+						if dist < 8 { // Увеличили радиус влияния воды
+							// Квадратичное затухание влияния
+							waterInfluence += 1.0 / (dist*dist + 1)
+						}
+					}
+				}
+			}
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Println("Ошибка подключения:", err)
-			continue
-		}
+			// Сильнее зависимость от высоты
+			heightEffect := math.Pow(float64(g.heightGrid[y][x])/float64(heightLevels-1), 1.5)
+			waterInfluence *= (1 - heightEffect*0.8)
 
-		go g.handleConnection(conn)
-	}
-}
+			// Добавляем немного случайности
+			waterInfluence += rand.Float64()*0.2 - 0.1
 
-func (g *Game) handleConnection(conn net.Conn) {
-	defer conn.Close()
-	decoder := gob.NewDecoder(conn)
-	encoder := gob.NewEncoder(conn)
-
-	g.mu.Lock()
-	err := encoder.Encode(struct {
-		Seed   int64
-		Tiles  [][]color.RGBA
-		Cities [][]bool
-	}{
-		Seed:   g.seed,
-		Tiles:  g.colorToRGBA(g.tiles),
-		Cities: g.cities,
-	})
-	g.mu.Unlock()
-
-	if err != nil {
-		log.Println("Ошибка отправки мира:", err)
-		return
-	}
-
-	var player Player
-	if err := decoder.Decode(&player); err != nil {
-		log.Println("Ошибка получения данных игрока:", err)
-		return
-	}
-
-	g.mu.Lock()
-	g.players[player.ID] = player
-	g.mu.Unlock()
-
-	g.broadcastPlayerUpdate(player)
-
-	for {
-		var update Player
-		if err := decoder.Decode(&update); err != nil {
-			log.Println("Клиент отключился:", err)
-			g.mu.Lock()
-			delete(g.players, update.ID)
-			g.mu.Unlock()
-			g.broadcastPlayerUpdate(update)
-			return
-		}
-
-		g.mu.Lock()
-		g.players[update.ID] = update
-		g.mu.Unlock()
-
-		g.broadcastPlayerUpdate(update)
-	}
-}
-
-func (g *Game) broadcastPlayerUpdate(player Player) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for _, p := range g.players {
-		if p.ID == player.ID {
-			continue
-		}
-		if g.conn != nil {
-			if err := g.encoder.Encode(player); err != nil {
-				log.Println("Ошибка рассылки:", err)
+			switch {
+			case waterInfluence >= 2.0:
+				g.humidityGrid[y][x] = Wet
+			case waterInfluence >= 1.0:
+				g.humidityGrid[y][x] = Moist
+			case waterInfluence >= 0.3:
+				g.humidityGrid[y][x] = Dry
+			default:
+				g.humidityGrid[y][x] = Arid
 			}
 		}
 	}
 }
 
-func (g *Game) connectToServer() {
-	fmt.Println("Введите адрес сервера (например: localhost:8080):")
-	var address string
-	_, err := fmt.Scanln(&address)
-	if err != nil {
-		log.Fatal("Ошибка ввода:", err)
+func (g *Game) generateBiomes() {
+	// 1. Создаем базовую сетку 24x24
+	baseBiomes := make([][]Biome, finalRows)
+	for y := 0; y < finalRows; y++ {
+		baseBiomes[y] = make([]Biome, finalCols)
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				baseBiomes[y][x] = Water
+				continue
+			}
+			temp := g.tempGrid[y][x]
+			humid := g.humidityGrid[y][x]
+			height := g.heightGrid[y][x]
+			baseBiomes[y][x] = g.determineBiome(temp, humid, height, x, y)
+		}
 	}
 
-	conn, err := net.Dial("tcp", address)
-	if err != nil {
-		log.Fatal("Ошибка подключения:", err)
-	}
-	g.conn = conn
-	g.encoder = gob.NewEncoder(conn)
-	g.decoder = gob.NewDecoder(conn)
-
-	var world struct {
-		Seed   int64
-		Tiles  [][]color.RGBA
-		Cities [][]bool
-	}
-	if err := g.decoder.Decode(&world); err != nil {
-		log.Fatal("Ошибка получения мира:", err)
+	// 2. Увеличиваем в 4 раза до 96x96
+	g.biomeGrid = make([][]Biome, biomeRows)
+	for y := 0; y < biomeRows; y++ {
+		g.biomeGrid[y] = make([]Biome, biomeCols)
+		for x := 0; x < biomeCols; x++ {
+			baseX, baseY := x/4, y/4
+			if baseX >= finalCols || baseY >= finalRows {
+				continue
+			}
+			g.biomeGrid[y][x] = baseBiomes[baseY][baseX]
+		}
 	}
 
-	g.seed = world.Seed
-	g.tiles = g.rgbaToColor(world.Tiles)
-	g.cities = world.Cities
-
-	g.perlin = NewPerlin(g.seed)
-	g.noiseMap = make([][]float64, len(g.tiles))
-	for y := range g.noiseMap {
-		g.noiseMap[y] = make([]float64, len(g.tiles[0]))
+	// 3. Специальное сглаживание границ воды (3 прохода)
+	for i := 0; i < 3; i++ {
+		g.smoothWaterEdges()
 	}
 
-	g.generateCities()
-
-	if err := g.encoder.Encode(g.me); err != nil {
-		log.Fatal("Ошибка отправки данных игрока:", err)
+	// 4. Основное сглаживание биомов
+	for i := 0; i < 5; i++ {
+		g.smoothBiomesEnhanced()
 	}
 
-	go g.handleServerUpdates()
+	// 5. Финальное сглаживание с шумом
+	g.applyCoastalNoise()
 }
 
-func (g *Game) handleServerUpdates() {
-	for {
-		var player Player
-		if err := g.decoder.Decode(&player); err != nil {
-			log.Println("Соединение с сервером разорвано:", err)
-			return
-		}
+func (g *Game) smoothWaterEdges() {
+	newGrid := make([][]Biome, biomeRows)
+	for y := 0; y < biomeRows; y++ {
+		newGrid[y] = make([]Biome, biomeCols)
+		for x := 0; x < biomeCols; x++ {
+			current := g.biomeGrid[y][x]
+			waterNeighbors := g.countWaterNeighborsInBiomeGrid(x, y)
+			landNeighbors := 8 - waterNeighbors
 
-		g.mu.Lock()
-		if player.ID != g.me.ID {
-			g.players[player.ID] = player
-		}
-		g.mu.Unlock()
-	}
-}
+			// Новые правила для более естественных границ
+			switch {
+			case current == Water:
+				// Плавный переход от воды к суше
+				if landNeighbors >= 5 {
+					// Случайный выбор прибрежного биома для разнообразия
+					if rand.Float32() < 0.7 {
+						newGrid[y][x] = g.getCoastalBiome(x, y)
+					} else {
+						newGrid[y][x] = Water
+					}
+				} else if landNeighbors >= 3 {
+					// 50% шанс превращения в прибрежный биом
+					if rand.Float32() < 0.5 {
+						newGrid[y][x] = g.getCoastalBiome(x, y)
+					} else {
+						newGrid[y][x] = Water
+					}
+				} else {
+					newGrid[y][x] = Water
+				}
 
-func (g *Game) colorToRGBA(tiles [][]color.Color) [][]color.RGBA {
-	rgba := make([][]color.RGBA, len(tiles))
-	for y := range tiles {
-		rgba[y] = make([]color.RGBA, len(tiles[y]))
-		for x := range tiles[y] {
-			r, g, b, a := tiles[y][x].RGBA()
-			rgba[y][x] = color.RGBA{
-				R: uint8(r >> 8),
-				G: uint8(g >> 8),
-				B: uint8(b >> 8),
-				A: uint8(a >> 8),
+			case current != Water:
+				// Более плавное проникновение воды в сушу
+				if waterNeighbors >= 6 {
+					newGrid[y][x] = Water
+				} else if waterNeighbors >= 4 {
+					if rand.Float32() < 0.3 {
+						newGrid[y][x] = Water
+					} else {
+						newGrid[y][x] = current
+					}
+				} else {
+					newGrid[y][x] = current
+				}
 			}
 		}
 	}
-	return rgba
+	g.biomeGrid = newGrid
 }
 
-func (g *Game) rgbaToColor(rgba [][]color.RGBA) [][]color.Color {
-	tiles := make([][]color.Color, len(rgba))
-	for y := range rgba {
-		tiles[y] = make([]color.Color, len(rgba[y]))
-		for x := range rgba[y] {
-			tiles[y][x] = rgba[y][x]
+func (g *Game) smoothWaterBorders() {
+	newGrid := make([][]bool, finalRows)
+	for y := 0; y < finalRows; y++ {
+		newGrid[y] = make([]bool, finalCols)
+		for x := 0; x < finalCols; x++ {
+			waterNeighbors := g.countWaterNeighbors(x, y)
+			current := g.finalGrid[y][x]
+
+			// Правила сглаживания:
+			if !current { // Если это вода
+				if waterNeighbors == 8 { // Полностью окружена водой
+					newGrid[y][x] = false // Остается водой (глубокую воду обработаем позже)
+				} else if waterNeighbors >= 5 { // Больше воды вокруг
+					newGrid[y][x] = false
+				} else {
+					// 50% шанс превратиться в землю, если соседствует с землей
+					newGrid[y][x] = rand.Float32() < 0.5
+				}
+			} else {
+				newGrid[y][x] = current
+			}
 		}
 	}
-	return tiles
+	g.finalGrid = newGrid
+}
+
+func (g *Game) markDeepWater() {
+	for y := 0; y < finalRows; y++ {
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] { // Если это вода
+				waterNeighbors := g.countWaterNeighbors(x, y)
+				if waterNeighbors == 8 { // Полностью окружена водой
+					// Преобразуем координаты в biomeGrid
+					biomeX, biomeY := x/4, y/4
+					if biomeX < finalCols && biomeY < finalRows {
+						g.biomeGrid[biomeY][biomeX] = DeepWater
+					}
+				}
+			}
+		}
+	}
+}
+
+func (g *Game) countWaterNeighbors(x, y int) int {
+	count := 0
+	for ny := y - 1; ny <= y+1; ny++ {
+		for nx := x - 1; nx <= x+1; nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if nx >= 0 && nx < finalCols && ny >= 0 && ny < finalRows {
+				if !g.finalGrid[ny][nx] {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func (g *Game) getCoastalBiome(x, y int) Biome {
+	baseX, baseY := x/4, y/4
+	if baseX >= 0 && baseX < finalCols && baseY >= 0 && baseY < finalRows {
+		temp := g.tempGrid[baseY][baseX]
+
+		// Выбираем прибрежный биом в зависимости от температуры
+		switch temp {
+		case Frozen:
+			return Tundra
+		case Hot:
+			if rand.Float32() < 0.3 {
+				return Desert
+			}
+			return Meadow
+		default:
+			return Meadow
+		}
+	}
+	return Meadow
+}
+
+func (g *Game) applyCoastalNoise() {
+	noise := perlinNoiseGenerator(4, 0.5, 2.0, g.seed+1) // Отдельный seed для шума воды
+
+	for y := 1; y < biomeRows-1; y++ {
+		for x := 1; x < biomeCols-1; x++ {
+			if g.biomeGrid[y][x] == Water {
+				continue
+			}
+
+			waterNeighbors := g.countWaterNeighborsInBiomeGrid(x, y)
+			if waterNeighbors == 0 {
+				continue
+			}
+
+			// Используем шум Перлина для плавных изменений
+			n := (noise.Noise2D(float64(x)/10, float64(y)/10) + 1) / 2 // Нормализуем от 0 до 1
+
+			// Чем больше соседей-воды, тем выше вероятность изменения
+			probability := float32(waterNeighbors) / 8 * 0.5
+			probability += float32(n) * 0.3
+
+			if rand.Float32() < probability {
+				if g.biomeGrid[y][x] != Water {
+					g.biomeGrid[y][x] = g.getCoastalBiome(x, y)
+				}
+			}
+		}
+	}
+}
+
+func (g *Game) smoothBiomesEnhanced() {
+	newGrid := make([][]Biome, biomeRows)
+	for y := 0; y < biomeRows; y++ {
+		newGrid[y] = make([]Biome, biomeCols)
+		for x := 0; x < biomeCols; x++ {
+			current := g.biomeGrid[y][x]
+			neighbors := g.getExtendedBiomeNeighbors(x, y)
+			waterNeighbors := g.countWaterNeighborsInBiomeGrid(x, y)
+
+			// Учитываем больше соседей
+			dominantBiome := current
+			maxCount := 0
+			for biome, count := range neighbors {
+				if count > maxCount {
+					maxCount = count
+					dominantBiome = biome
+				}
+			}
+
+			// Более плавные правила перехода
+			switch {
+			case waterNeighbors > 0 && current != Water:
+				if rand.Float32() < 0.9-float32(waterNeighbors)/10 {
+					newGrid[y][x] = g.getCoastalBiome(x, y)
+				} else {
+					newGrid[y][x] = current
+				}
+			case maxCount >= 8:
+				newGrid[y][x] = dominantBiome
+			case maxCount >= 5:
+				if rand.Float32() < 0.8 {
+					newGrid[y][x] = dominantBiome
+				} else {
+					newGrid[y][x] = current
+				}
+			default:
+				newGrid[y][x] = current
+			}
+		}
+	}
+	g.biomeGrid = newGrid
+}
+
+func (g *Game) getExtendedBiomeNeighbors(x, y int) map[Biome]int {
+	neighbors := make(map[Biome]int)
+	// Проверяем 8 соседей вместо 4
+	for ny := y - 2; ny <= y+2; ny++ {
+		for nx := x - 2; nx <= x+2; nx++ {
+			if nx == x && ny == y {
+				continue // Пропускаем текущую клетку
+			}
+			if nx >= 0 && nx < biomeCols && ny >= 0 && ny < biomeRows && g.isLandInBaseGrid(nx, ny) {
+				neighbors[g.biomeGrid[ny][nx]]++
+			}
+		}
+	}
+	return neighbors
+}
+
+func (g *Game) countWaterNeighborsInBiomeGrid(x, y int) int {
+	count := 0
+	// Проверяем 24 соседа (5x5 область) для более плавных переходов
+	for ny := y - 2; ny <= y+2; ny++ {
+		for nx := x - 2; nx <= x+2; nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if nx >= 0 && nx < biomeCols && ny >= 0 && ny < biomeRows {
+				if g.biomeGrid[ny][nx] == Water {
+					// Вес зависит от расстояния
+					dist := math.Sqrt(float64((nx-x)*(nx-x) + (ny-y)*(ny-y)))
+					weight := 1.0 / (dist + 1)
+					count += int(weight * 3)
+				}
+			}
+		}
+	}
+	return count
+}
+
+func (g *Game) isLandInBaseGrid(x, y int) bool {
+	baseX, baseY := x/4, y/4 // Изменили делитель с 2 на 4
+	return baseX < finalCols && baseY < finalRows && g.finalGrid[baseY][baseX]
+}
+
+func (g *Game) determineBiome(temp Temperature, humid Humidity, height Height, x, y int) Biome {
+	switch temp {
+	case Frozen:
+		if height >= Mountains {
+			// Проверяем, нет ли воды рядом
+			if x >= 0 && x < finalCols && y >= 0 && y < finalRows {
+				if g.hasWaterNeighbors(x, y) {
+					return Tundra // У воды вместо гор делаем тундру
+				}
+			}
+			return IceMountains
+		}
+		return Tundra
+
+	case Hot:
+		if height >= Hills {
+			if humid == Wet {
+				return Volcano
+			}
+			return Forest // Горы в жарком климате
+		}
+		if humid == Arid {
+			return Desert
+		}
+		return Meadow
+
+	case Warm:
+		switch height {
+		case HighMountains:
+			return IceMountains
+		case Mountains:
+			if humid == Wet {
+				return Jungle
+			}
+			return Forest
+		default:
+			if humid == Wet {
+				return Jungle
+			}
+			if humid == Moist {
+				return Meadow
+			}
+			return Forest
+		}
+	case Cold:
+		return Tundra
+	default:
+		return Meadow
+	}
+}
+
+func (g *Game) hasWaterNeighbors(x, y int) bool {
+	for ny := y - 1; ny <= y+1; ny++ {
+		for nx := x - 1; nx <= x+1; nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if nx >= 0 && nx < finalCols && ny >= 0 && ny < finalRows {
+				if !g.finalGrid[ny][nx] { // Если это вода
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (g *Game) Regenerate() {
+	rand.Seed(g.seed)
+
+	// 1. Генерация базовой сетки 6x6
+	for y := 0; y < initialRows; y++ {
+		g.initialGrid[y] = make([]bool, initialCols)
+		for x := 0; x < initialCols; x++ {
+			g.initialGrid[y][x] = rand.Float32() < 0.35
+		}
+	}
+
+	// 2. Масштабирование и сглаживание
+	g.upscaleAndSmooth()
+
+	// 3. Генерация карты высот
+	g.generateHeightMap()
+
+	// 4. Генерация температур
+	g.assignTemperatures()
+
+	// 5. Корректировка температуры
+	g.adjustTemperatureWithHeight()
+
+	// 6. Генерация влажности
+	g.generateHumidity()
+
+	// 7. Генерация биомов (инициализирует biomeGrid)
+	g.generateBiomes()
+
+	// 8. Пометка глубокой воды (теперь biomeGrid инициализирован)
+	g.markDeepWater()
+}
+
+func (g *Game) upscaleAndSmooth() {
+	intermediateCols := finalCols / 2
+	intermediateRows := finalRows / 2
+	intermediateGrid := make([][]bool, intermediateRows)
+
+	for y := 0; y < intermediateRows; y++ {
+		intermediateGrid[y] = make([]bool, intermediateCols)
+		for x := 0; x < intermediateCols; x++ {
+			intermediateGrid[y][x] = g.initialGrid[y/2][x/2]
+		}
+	}
+
+	g.finalGrid = make([][]bool, finalRows)
+	for y := 0; y < finalRows; y++ {
+		g.finalGrid[y] = make([]bool, finalCols)
+		for x := 0; x < finalCols; x++ {
+			baseValue := intermediateGrid[y/2][x/2]
+			if rand.Float32() < 0.15 {
+				baseValue = !baseValue
+			}
+			g.finalGrid[y][x] = baseValue
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		g.applyCellularAutomaton()
+	}
+
+	g.smoothWaterBorders()
+}
+
+func (g *Game) applyCellularAutomaton() {
+	newGrid := make([][]bool, finalRows)
+	for y := 0; y < finalRows; y++ {
+		newGrid[y] = make([]bool, finalCols)
+		for x := 0; x < finalCols; x++ {
+			count := g.countLandNeighbors(x, y)
+			// Более мягкие правила для сглаживания
+			if g.finalGrid[y][x] {
+				newGrid[y][x] = count >= 3 // Было 4
+			} else {
+				newGrid[y][x] = count >= 5
+			}
+		}
+	}
+	g.finalGrid = newGrid
+}
+
+func (g *Game) countLandNeighbors(x, y int) int {
+	count := 0
+	for ny := y - 1; ny <= y+1; ny++ {
+		for nx := x - 1; nx <= x+1; nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if nx >= 0 && nx < finalCols && ny >= 0 && ny < finalRows && g.finalGrid[ny][nx] {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// 3-й этап: распределение температур (4:1:1)
+
+func (g *Game) assignTemperatures() {
+	g.tempGrid = make([][]Temperature, finalRows)
+	for y := 0; y < finalRows; y++ {
+		g.tempGrid[y] = make([]Temperature, finalCols)
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				continue
+			}
+
+			// Сильнее зависимость от широты
+			latitudeEffect := math.Pow(float64(y)/float64(finalRows), 2)
+			heightEffect := float64(g.heightGrid[y][x]) * 0.25
+
+			// Добавляем шум для плавности
+			noise := rand.Float64() * 0.2
+			r := noise + latitudeEffect*0.7 - heightEffect*0.5
+
+			switch {
+			case r < 0.15:
+				g.tempGrid[y][x] = Frozen
+			case r < 0.35:
+				g.tempGrid[y][x] = Cold
+			case r < 0.80:
+				g.tempGrid[y][x] = Warm
+			default:
+				g.tempGrid[y][x] = Hot
+			}
+		}
+	}
+
+	// Больше итераций сглаживания
+	for i := 0; i < 10; i++ {
+		g.applyTemperatureAutomaton()
+	}
+}
+
+func (g *Game) applyTemperatureAutomaton() {
+	newTempGrid := make([][]Temperature, finalRows)
+	for y := 0; y < finalRows; y++ {
+		newTempGrid[y] = make([]Temperature, finalCols)
+		for x := 0; x < finalCols; x++ {
+			if !g.finalGrid[y][x] {
+				continue
+			}
+
+			neighbors := g.getTemperatureNeighbors(x, y, g.tempGrid)
+
+			// Система приоритетов (от высшего к низшему)
+			switch {
+			// 1. Правило для горячих зон (высший приоритет)
+			case neighbors[Hot] > 0 && (neighbors[Cold] > 0 || neighbors[Frozen] > 0):
+				newTempGrid[y][x] = Warm
+
+			// 2. Правило для снега
+			case neighbors[Frozen] >= 2:
+				newTempGrid[y][x] = Snow
+
+			// 3. Правило для горячих зон (классическое)
+			case neighbors[Warm] >= 6:
+				newTempGrid[y][x] = Hot
+
+			// 4. Правило для льда
+			case neighbors[Cold] >= 2:
+				newTempGrid[y][x] = Frozen
+
+			// 5. Правило для прохладных зон
+			case neighbors[Warm] > 0 && neighbors[Cold] > 0:
+				newTempGrid[y][x] = Cool
+
+			// Сохраняем текущую температуру
+			default:
+				newTempGrid[y][x] = g.tempGrid[y][x]
+			}
+		}
+	}
+	g.tempGrid = newTempGrid
+}
+
+// Возвращает карту соседей по температуре
+
+func (g *Game) getTemperatureNeighbors(x, y int, grid [][]Temperature) map[Temperature]int {
+	neighbors := map[Temperature]int{
+		Warm:   0,
+		Hot:    0,
+		Cold:   0,
+		Frozen: 0,
+		Cool:   0,
+		Snow:   0,
+	}
+
+	for ny := y - 1; ny <= y+1; ny++ {
+		for nx := x - 1; nx <= x+1; nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if nx >= 0 && nx < finalCols && ny >= 0 && ny < finalRows && g.finalGrid[ny][nx] {
+				temp := grid[ny][nx]
+				neighbors[temp]++
+			}
+		}
+	}
+	return neighbors
 }
 
 func (g *Game) Update() error {
-	g.handleMovementInput()
-	g.handleCameraInput()
-	g.handleCityGenerationInput()
-	g.handleCityWindowToggle()
-	g.updateHoverCity()
-	g.updateCityMap()
-	g.cityWindow.Update()
-
-	if inpututil.IsKeyJustPressed(ebiten.KeyP) { // Обработка нажатия P
-		g.toggleCharacterWindow()
+	// Переключение режима отображения по пробелу
+	if inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+		g.showInitial = !g.showInitial
 	}
 
-	if g.characterWindowOpen {
-		g.handleCharacterWindowInput()
-	}
-
-	if g.conn != nil {
-		g.sendPlayerPosition()
+	// Регенерация карты по клику мыши
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		g.seed = time.Now().UnixNano()
+		g.Regenerate()
 	}
 
 	return nil
 }
 
-func (g *Game) handleMovementInput() {
-	speed := 1
-	if inpututil.IsKeyJustPressed(ebiten.KeyW) || inpututil.IsKeyJustPressed(ebiten.KeyUp) {
-		g.me.Y -= speed
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyS) || inpututil.IsKeyJustPressed(ebiten.KeyDown) {
-		g.me.Y += speed
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyA) || inpututil.IsKeyJustPressed(ebiten.KeyLeft) {
-		g.me.X -= speed
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyD) || inpututil.IsKeyJustPressed(ebiten.KeyRight) {
-		g.me.X += speed
-	}
-	// В методе handleMovementInput в main.go
-	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
-		mx, my := ebiten.CursorPosition()
-		mapX, mapY := (mx+g.cameraX)/cellSize, (my+g.cameraY)/cellSize
+var emptySubImage = ebiten.NewImage(1, 1).SubImage(image.Rect(0, 0, 1, 1)).(*ebiten.Image)
 
-		// Проверяем клик по городу
-		clickedCity := g.findCityAt(mapX, mapY)
-		if clickedCity != nil {
-			g.initCityMap(clickedCity) // Инициализируем карту города
-		}
-	}
-
-	cols := screenWidth / cellSize
-	rows := screenHeight / cellSize
-	g.me.X = clamp(g.me.X, 0, cols-1)
-	g.me.Y = clamp(g.me.Y, 0, rows-1)
-}
-
-func (g *Game) handleCameraInput() {
-	if ebiten.IsKeyPressed(ebiten.KeyArrowLeft) {
-		g.cameraX -= 5
-	}
-	if ebiten.IsKeyPressed(ebiten.KeyArrowRight) {
-		g.cameraX += 5
-	}
-	if ebiten.IsKeyPressed(ebiten.KeyArrowUp) {
-		g.cameraY -= 5
-	}
-	if ebiten.IsKeyPressed(ebiten.KeyArrowDown) {
-		g.cameraY += 5
-	}
-}
-
-func (g *Game) handleCityGenerationInput() {
-	if g.mode == "server" && inpututil.IsKeyJustPressed(ebiten.KeyG) {
-		g.generateNewCities()
-	}
-	if g.mode == "server" && inpututil.IsKeyJustPressed(ebiten.KeyR) {
-		g.regenerateWorld()
-	}
-}
-
-func (g *Game) regenerateWorld() {
-	g.seed = time.Now().UnixNano()
-	g.generateWorld()
-	g.generateCities()
-}
-
-func (g *Game) handleCityWindowToggle() {
-	if inpututil.IsKeyJustPressed(ebiten.KeyTab) {
-		g.cityWindow.open = !g.cityWindow.open
-	}
-}
-
-func (g *Game) updateHoverCity() {
-	mouseX, mouseY := ebiten.CursorPosition()
-	mapX, mapY := (mouseX+g.cameraX)/cellSize, (mouseY+g.cameraY)/cellSize
-	g.hoverCity = g.findCityAt(mapX, mapY)
-}
-
-func (g *Game) sendPlayerPosition() {
-	if err := g.encoder.Encode(g.me); err != nil {
-		log.Println("Ошибка отправки позиции:", err)
-	}
-}
-
-func (g *Game) generateNewCities() {
-	g.seed = time.Now().UnixNano()
-	g.generateWorld()
-	g.generateCities()
-	g.cityWindow.cities = g.cityList
+func (g *Game) drawDebugInfo(screen *ebiten.Image) {
+	debugText := fmt.Sprintf(
+		"Seed: %d\n"+
+			"Biomes:\n"+
+			"Tundra (белый)\n"+
+			"Desert (песок)\n"+
+			"Volcano (красный)\n"+
+			"Forest (зеленый)\n"+
+			"Meadow (салатовый)\n"+
+			"Jungle (темно-зеленый)\n"+
+			"IceMountains (голубой)\n"+
+			"WASD: перемещение\n"+
+			"R: регенерация",
+		g.seed,
+	)
+	ebitenutil.DebugPrint(screen, debugText)
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
-	for y := range g.tiles {
-		for x := range g.tiles[y] {
-			screenX := x*cellSize - g.cameraX
-			screenY := y*cellSize - g.cameraY
-
-			if g.isVisible(screenX, screenY, cellSize, cellSize) {
-				ebitenutil.DrawRect(
-					screen,
-					float64(screenX),
-					float64(screenY),
-					cellSize,
-					cellSize,
-					g.tiles[y][x],
-				)
+	for y := 0; y < biomeRows; y++ {
+		for x := 0; x < biomeCols; x++ {
+			var biomeColor color.RGBA
+			switch g.biomeGrid[y][x] {
+			case Water:
+				biomeColor = color.RGBA{70, 130, 180, 255} // Стандартная вода
+			case DeepWater:
+				biomeColor = color.RGBA{25, 55, 100, 255} // Темная глубокая вода
+			case Tundra:
+				biomeColor = color.RGBA{245, 245, 255, 255}
+			case Desert:
+				biomeColor = color.RGBA{210, 185, 100, 255}
+			case Volcano:
+				biomeColor = color.RGBA{200, 50, 30, 255}
+			case Forest:
+				biomeColor = color.RGBA{50, 120, 50, 255}
+			case Meadow:
+				biomeColor = color.RGBA{120, 200, 80, 255}
+			case Jungle:
+				biomeColor = color.RGBA{30, 90, 30, 255}
+			case IceMountains:
+				biomeColor = color.RGBA{180, 220, 255, 255}
+			default:
+				biomeColor = color.RGBA{120, 120, 120, 255}
 			}
+
+			// Рисуем клетку биома
+			ebitenutil.DrawRect(
+				screen,
+				float64(x*biomeCellWidth),
+				float64(y*biomeCellHeight),
+				biomeCellWidth,
+				biomeCellHeight,
+				biomeColor,
+			)
 		}
 	}
 
-	if g.characterWindowOpen {
-		g.drawCharacterWindow(screen)
-	}
+	// Рисуем отладочную информацию
+	g.drawDebugInfo(screen)
 
-	debugInfo := fmt.Sprintf(
-		"Городов: %d | Камера: (%d, %d) | Seed: %d",
-		len(g.cityList),
-		g.cameraX,
-		g.cameraY,
-		g.seed,
-	)
-	text.Draw(screen, debugInfo, g.font, 10, screenHeight-30, color.White)
-
-	g.mu.Lock()
-	for _, player := range g.players {
-		if player.ID == g.me.ID {
-			continue
-		}
-		ebitenutil.DrawRect(
-			screen,
-			float64(player.X*cellSize),
-			float64(player.Y*cellSize),
-			cellSize,
-			cellSize,
-			player.Color,
-		)
-	}
-	g.mu.Unlock()
-
-	ebitenutil.DrawRect(
-		screen,
-		float64(g.me.X*cellSize),
-		float64(g.me.Y*cellSize),
-		cellSize,
-		cellSize,
-		color.RGBA{255, 255, 255, 255},
-	)
-
-	info := fmt.Sprintf("Режим: %s | ID: %s\n", g.mode, g.me.ID)
-	if g.mode == "server" {
-		info += "Нажмите R для новой карты\n"
-	}
-	info += fmt.Sprintf("Позиция: %d, %d\nИгроков онлайн: %d\nTPS: %0.2f",
-		g.me.X, g.me.Y, len(g.players), ebiten.ActualTPS())
-	ebitenutil.DebugPrint(screen, info)
-
-	g.drawCities(screen)
-	g.cityWindow.Draw(screen)
-	g.drawCityMap(screen) // Рисуем карту города поверх всего
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
-	// Если открыта карта города, увеличиваем окно
-	if g.cityMap != nil && g.cityMap.Open {
-		return cityMapSize * buildingSize * cityMapScale,
-			cityMapSize*buildingSize*cityMapScale + 40
-	}
 	return screenWidth, screenHeight
 }
 
-func (g *Game) isVisible(x, y, width, height int) bool {
-	return x+width > 0 && x < screenWidth &&
-		y+height > 0 && y < screenHeight
-}
+func main() {
+	ebiten.SetWindowSize(screenWidth, screenHeight)
+	ebiten.SetWindowTitle("Procedural Biome Map")
 
-func initConsole() {
-	// Для Windows пытаемся настроить UTF-8
-	if isWindows() {
-		exec.Command("chcp", "65001").Run()
+	if err := ebiten.RunGame(NewGame()); err != nil {
+		panic(err)
 	}
-}
-
-func isWindows() bool {
-	return os.PathSeparator == '\\'
 }
