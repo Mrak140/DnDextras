@@ -68,15 +68,15 @@ func (tm *TemperatureMap) Generate(width, height int) {
 
 			// Распределяем температуры с учетом климатических зон
 			switch {
-			case normalized < 0.1: // 10% самых холодных - ледяные
+			case normalized < 0.1: // 10% - Frozen
 				tm.Grid[y][x] = Frozen
-			case normalized < 0.3: // 20% - холодные
+			case normalized < 0.25: // 15% - Cold
 				tm.Grid[y][x] = Cold
-			case normalized < 0.5: // 20% - прохладные
+			case normalized < 0.45: // 20% - Cool
 				tm.Grid[y][x] = Cool
-			case normalized < 0.8: // 30% - теплые
+			case normalized < 0.75: // 30% - Warm
 				tm.Grid[y][x] = Warm
-			default: // 20% самых горячих
+			default: // 20% - Hot
 				tm.Grid[y][x] = Hot
 			}
 		}

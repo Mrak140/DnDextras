@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/aquilax/go-perlin"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -90,19 +91,29 @@ func (g *Game) distanceToWater(x, y int) float64 {
 
 func (g *Game) generateHumidity() {
 	g.humidityGrid = make([][]Humidity, finalRows)
+	rand.Seed(g.seed) // Для согласованности с температурной картой
+
+	// Создаем карту шума для влажности
+	p := perlin.NewPerlin(2, 2, 3, g.seed+1) // Используем другой seed, чем у температуры
+
 	for y := 0; y < finalRows; y++ {
 		g.humidityGrid[y] = make([]Humidity, finalCols)
 		for x := 0; x < finalCols; x++ {
 			if !g.finalGrid[y][x] {
-				continue
+				continue // Вода всегда считается влажной
 			}
-			dist := g.distanceToWater(x, y)
+
+			// Комбинируем расстояние до воды и шум Перлина
+			distFactor := 1 - g.distanceToWater(x, y) // Чем ближе к воде, тем выше влажность
+			noise := p.Noise2D(float64(x)/10, float64(y)/10)
+			combined := (distFactor*0.7 + (noise+1)*0.3) / 2 // Нормализуем
+
 			switch {
-			case dist < 0.2:
+			case combined > 0.7:
 				g.humidityGrid[y][x] = Wet
-			case dist < 0.4:
+			case combined > 0.5:
 				g.humidityGrid[y][x] = Moist
-			case dist < 0.7:
+			case combined > 0.3:
 				g.humidityGrid[y][x] = Dry
 			default:
 				g.humidityGrid[y][x] = Arid
@@ -317,15 +328,28 @@ func (g *Game) determineBiome(x, y int) Biome {
 	temp := g.temperature.GetTemperature(x, y)
 	humid := g.humidityGrid[y][x]
 
+	// Сначала проверяем воду (глубокую и мелкую)
+	if !g.finalGrid[y][x] {
+		if g.countWaterNeighbors(x, y) == 8 {
+			return DeepWater
+		}
+		return Water
+	}
+
+	// Определяем биомы на суше с четкой привязкой к температурным экстремумам
 	switch temp {
 	case Frozen:
-		// Ледяные горы для замороженных зон
+		// Только самые холодные точки - ледяные горы
 		return IceMountains
+
 	case Cold:
-		// Тундра для холодных зон
+		// Холодные зоны - преимущественно тундра
+		if humid == Wet && rand.Float32() < 0.1 { // 10% шанс на лес у воды
+			return Forest
+		}
 		return Tundra
+
 	case Cool:
-		// Для прохладных зон выбираем между лесом, джунглями и лугами в зависимости от влажности
 		switch humid {
 		case Wet:
 			return Jungle
@@ -334,14 +358,21 @@ func (g *Game) determineBiome(x, y int) Biome {
 		default:
 			return Meadow
 		}
+
 	case Warm:
-		// Пустыни для теплых зон
+		if humid == Wet {
+			return Jungle
+		}
+		if humid == Moist {
+			return Forest
+		}
 		return Desert
+
 	case Hot:
-		// Вулканы для самых горячих зон
+		// Самые горячие точки - гарантированно вулканы
 		return Volcano
+
 	default:
-		// По умолчанию возвращаем луг
 		return Meadow
 	}
 }
